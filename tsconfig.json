@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "./",
+    "resolveJsonModule": true,
+    "moduleResolution": "node",
+    "module": "commonjs",
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "allowJs": true,
+    "declaration": true,
+    "lib": ["es2017", "esnext.asynciterable", "dom", "es5", "es6", "es2015"],
+    "target": "es2017"
+  },
+  "exclude": ["node_modules", "dist"]
+}

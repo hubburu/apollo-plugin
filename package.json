@@ -1,0 +1,22 @@
+{
+  "name": "hubburu",
+  "version": "0.0.1",
+  "description": "A middleware for integrating Hubburu with Apollo Server",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "prepublish": "tsc"
+  },
+  "public": true,
+  "author": "hello@hubburu.com",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^17.0.21",
+    "typescript": "^4.6.2"
+  },
+  "peerDependencies": {
+    "graphql": "15 - 17",
+    "apollo-server-plugin-base": "3 - 4"
+  }
+}
