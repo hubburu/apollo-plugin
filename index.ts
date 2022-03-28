@@ -3,11 +3,10 @@ import type {
   GraphQLRequestContext,
 } from "apollo-server-plugin-base";
 import { createHash } from "crypto";
-import { printSchema } from "graphql";
+import { GraphQLSchema, printSchema } from "graphql";
 import util from "util";
 import { gzip as nonPromiseGzip } from "zlib";
-import http from "http";
-import https from "https";
+import fetch from "node-fetch";
 
 /**
  * Assume that only one schema can run at the same time.
@@ -127,20 +126,66 @@ const sha256 = (
 interface CommonPluginArgs<T> {
   contextToRequestId: (context: GraphQLRequestContext<T>["context"]) => string;
   apiKey?: string;
+  /**
+   * A function to determine if a certain operation should be traced. It is
+   * common practice in performance tracing to only measure a subset of
+   * operations to reduce overhead. A simple function you could use is
+   * something like `() => Math.random() > 0.99`. Return true to include.
+   */
+  sampleFunction?: (ctx: GraphQLRequestContext<T>) => boolean;
+  /**
+   * If you wish to send the latest schema to Hubburu on server startup. The alternative is to send it with the pushHubburuSchema function in a CI pipeline.
+   */
   pushSchemaOnStartup?: boolean;
+  /**
+   * A function to provide the current client name, to better track usage in
+   * Hubburu.
+   */
+  getClientName?: (ctx: GraphQLRequestContext<T>) => string;
+  /**
+   * A function to provide the current client version, to better track usage
+   * in Hubburu.
+   */
+  getClientVersion?: (ctx: GraphQLRequestContext<T>) => string;
+  /**
+   * A function to let you avoid sending a report that only creates noise in
+   * your Hubburu dashboard (or pushes you to a new pricing tier).
+   */
+  shouldSend?: (report: HubburuReport) => boolean;
+  /**
+   * A string to identify the current environment. Like "staging" or
+   * "production". Should match the call to pushHubburuSchema.
+   */
   environment?: string;
 }
 
 interface ImmediatePluginArgs<T> extends CommonPluginArgs<T> {
+  /**
+   * sendMode will determine how the plugin will send the report to the Hubburu servers.
+   * "IMMEDIATE" = send it before the response is sent to clients.
+   * "BACKGROUND" = runs at an interval, which is being tracked in memory. Not suitable when running in an environment like AWS lambda.
+   * "QUEUE" = you control it, suitable if you want to send reports from a background job. Use the queueReport argument to queue reports.
+   */
   sendMode: "IMMEDIATE";
+}
+
+interface BackgroundPluginArgs<T> extends CommonPluginArgs<T> {
+  sendMode: "BACKGROUND";
 }
 
 interface QueuePluginArgs<T> extends CommonPluginArgs<T> {
   sendMode: "QUEUE";
+  /**
+   * This function will be called when the plugin is done with the report.
+   * The report should be sent using the sendHubburuReport function at a time of your choosing.
+   */
   queueReport: (report: PendingReport) => Promise<any>;
 }
 
-type PluginArgs<T> = ImmediatePluginArgs<T> | QueuePluginArgs<T>;
+type PluginArgs<T> =
+  | ImmediatePluginArgs<T>
+  | QueuePluginArgs<T>
+  | BackgroundPluginArgs<T>;
 
 interface PendingReport {
   report: string;
@@ -166,51 +211,77 @@ export interface HubburuReport {
   };
 }
 
+const queue = [] as PendingReport[];
+const runQueue = () => {
+  setInterval(() => {
+    while (queue.length > 0) {
+      const report = queue.pop();
+      sendHubburuReport(report);
+    }
+  }, 15000);
+};
+const queueReport = (report: PendingReport): void => {
+  queue.push(report);
+};
+
 const reportUrl =
   process.env.HUBBURU_REPORT_URL || "https://report.hubburu.com";
-const parsedUrl = new URL(reportUrl);
 
-const requestor = parsedUrl.protocol === "http:" ? http : https;
-
-export const sendHubburuReport = ({ report, apiKey }: PendingReport) => {
-  return new Promise<void>((resolve, reject) => {
-    const request = requestor.request(
-      {
-        hostname: parsedUrl.hostname,
-        port: parsedUrl.port || "443",
-        path: "/operation",
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": apiKey,
-        },
+export const sendHubburuReport = async ({ report, apiKey }: PendingReport) => {
+  try {
+    await fetch(`${reportUrl}/operation`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
       },
-      (res) => {
-        res.on("data", (d) => {
-          process.stdout.write(d);
-        });
-        console.log(
-          `reported to hubburu ${reportUrl}, status:${res.statusCode}`
-        );
-        resolve();
-      }
-    );
-    const data = new TextEncoder().encode(report);
-    request.write(data, (err) => {
-      request.end();
+      body: report,
     });
+  } catch (e) {
+    console.warn("Hubburu report error", e);
+  }
+};
+
+export const pushHubburuSchema = async ({
+  schema,
+  apiKey = process.env.HUBBURU_API_KEY,
+  environment = "default",
+}: {
+  schema: GraphQLSchema;
+  apiKey?: string;
+  environment?: string;
+}): Promise<void> => {
+  if (!apiKey && process.env.NODE_ENV !== "test") {
+    console.warn(
+      "HUBBURU_API_KEY not found in env and not found in function arguments"
+    );
+  }
+  const schemaSdl = printSchema(schema);
+  const gzippedSchema = (await gzip(schemaSdl)).toString("base64");
+  await fetch(`${reportUrl}/schema`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+    },
+    body: JSON.stringify({
+      sdl: gzippedSchema,
+      environment,
+    }),
   });
 };
 
 export const HubburuApolloServerPlugin: <T = any>(
   arg: PluginArgs<T>
-) => ApolloServerPlugin = (args) => {
+) => ApolloServerPlugin<T> = (args) => {
   const {
     contextToRequestId,
     sendMode,
     apiKey = process.env.HUBBURU_API_KEY,
     pushSchemaOnStartup = false,
     environment = "default",
+    sampleFunction = () => true,
+    shouldSend = () => true,
   } = args;
   savedContextToRequestId = contextToRequestId;
 
@@ -225,31 +296,14 @@ export const HubburuApolloServerPlugin: <T = any>(
   }
   return {
     serverWillStart: async (service) => {
+      if (sendMode === "BACKGROUND") {
+        runQueue();
+      }
       try {
         const schemaSdl = printSchema(service.schema);
         schemaSha256 = sha256(schemaSdl);
         if (pushSchemaOnStartup) {
-          const request = requestor.request({
-            hostname: parsedUrl.hostname,
-            port: parsedUrl.port || "443",
-            path: "/schema",
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "x-api-key": apiKey,
-            },
-          });
-          const gzippedSchema = (await gzip(schemaSdl)).toString("base64");
-          const data = new TextEncoder().encode(
-            JSON.stringify({
-              sdl: gzippedSchema,
-              environment,
-            })
-          );
-          request.write(data, (err) => {
-            console.error(err);
-            request.end();
-          });
+          pushHubburuSchema({ schema: service.schema, apiKey, environment });
         }
       } catch (e) {
         console.error(e);
@@ -257,12 +311,14 @@ export const HubburuApolloServerPlugin: <T = any>(
     },
     requestDidStart: async (ctx) => {
       const requestStartTime = process.hrtime();
+      const shouldTrace = sampleFunction(ctx);
       requestData[savedContextToRequestId(ctx.context)] = { requestStartTime };
 
       const tracing = [];
 
       return {
         executionDidStart: async () => {
+          if (!shouldTrace) return;
           return {
             willResolveField: ({ info }) => {
               let path = info.fieldName;
@@ -389,12 +445,16 @@ export const HubburuApolloServerPlugin: <T = any>(
               },
             };
 
+            if (!shouldSend(report)) return;
+
             const stringReport = JSON.stringify(report);
             const pendingReport = { report: stringReport, apiKey };
             if (sendMode === "QUEUE") {
               await args.queueReport(pendingReport);
-            } else {
+            } else if (sendMode === "IMMEDIATE") {
               await sendHubburuReport(pendingReport);
+            } else {
+              queueReport(pendingReport);
             }
           } catch (e) {
             console.error(e);
