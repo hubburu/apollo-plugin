@@ -1,3 +1,5 @@
+<a href="https://www.npmjs.com/package/hubburu"><img src="https://badge.fury.io/js/hubburu.svg"></a>
+
 # Apollo Hubburu plugin
 
 A middleware for integrating Hubburu with Apollo server
@@ -23,7 +25,7 @@ Register for Hubburu, and you will be able to access your API Key from there. Th
 
 ### Upload schema
 
-Either you can upload your schema on server startup. This is an OK way to do it but not suitable for all environments. If you want to manually send it (such as in a CI/CD pipeline) like this:
+Either you can upload your schema on server startup. This is an OK way to do it but not suitable for all environments. If you want to manually send it (such as in a CI/CD pipeline), you can do so like this:
 
 ```javascript
 const { pushHubburuSchema } = require("hubburu");
