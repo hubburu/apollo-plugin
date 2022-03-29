@@ -1,6 +1,6 @@
 {
   "name": "hubburu",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "description": "A middleware for integrating Hubburu with Apollo Server",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

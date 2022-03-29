@@ -2,12 +2,11 @@ import type {
   ApolloServerPlugin,
   GraphQLRequestContext,
 } from "apollo-server-plugin-base";
-import { createHash } from "crypto";
+import { randomBytes, createHash } from "crypto";
 import { GraphQLSchema, printSchema } from "graphql";
 import util from "util";
 import { gzip as nonPromiseGzip } from "zlib";
 import fetch from "node-fetch";
-
 /**
  * Assume that only one schema can run at the same time.
  */
@@ -296,7 +295,7 @@ export const HubburuApolloServerPlugin: <T = any>(
   }
   return {
     serverWillStart: async (service) => {
-      if (sendMode === "BACKGROUND") {
+      if (!sendMode || sendMode === "BACKGROUND") {
         runQueue();
       }
       try {
@@ -312,7 +311,12 @@ export const HubburuApolloServerPlugin: <T = any>(
     requestDidStart: async (ctx) => {
       const requestStartTime = process.hrtime();
       const shouldTrace = sampleFunction(ctx);
-      requestData[savedContextToRequestId(ctx.context)] = { requestStartTime };
+      const requestId =
+        savedContextToRequestId?.(ctx.context) ??
+        (await new Promise((r) =>
+          randomBytes(48, (err, buf) => r(buf.toString("hex")))
+        ));
+      requestData[requestId] = { requestStartTime };
 
       const tracing = [];
 
@@ -342,9 +346,8 @@ export const HubburuApolloServerPlugin: <T = any>(
         willSendResponse: async (requestContext) => {
           try {
             const postProcessingTimeStart = process.hrtime();
-            const reqData =
-              requestData[savedContextToRequestId(requestContext.context)];
-            delete requestData[savedContextToRequestId(requestContext.context)];
+            const reqData = requestData[requestId];
+            delete requestData[requestId];
 
             const stringOperation = requestContext.request.query;
 
@@ -425,7 +428,7 @@ export const HubburuApolloServerPlugin: <T = any>(
             }
 
             const report: HubburuReport = {
-              requestId: savedContextToRequestId(requestContext.context),
+              requestId,
               errors: zippedErrors?.toString("base64"),
               totalMs,
               operationName: ctx.operationName,
