@@ -2,15 +2,12 @@ import type {
   ApolloServerPlugin,
   GraphQLRequestContext,
 } from "apollo-server-plugin-base";
-import { randomBytes, createHash } from "crypto";
-import { GraphQLSchema, printSchema } from "graphql";
+import { createHash, randomBytes } from "crypto";
+import { GraphQLSchema, Kind, printSchema, TypeNode } from "graphql";
+import fetch from "node-fetch";
 import util from "util";
 import { gzip as nonPromiseGzip } from "zlib";
-import fetch from "node-fetch";
-/**
- * Assume that only one schema can run at the same time.
- */
-let schemaSha256: string;
+
 let savedContextToRequestId: (
   context: GraphQLRequestContext["context"]
 ) => string;
@@ -24,114 +21,11 @@ const toReportTime = ([seconds, nanoSeconds]) => {
 
 const requestData = {};
 
-export const wrapSyncFunction = (
-  name: string,
-  context: GraphQLRequestContext["context"],
-  fn: (...args: any[]) => any
-) => {
-  return (...args: any[]) => {
-    const requestId = savedContextToRequestId(context);
-    if (!requestId || typeof requestId !== "string") {
-      console.warn(
-        `requestId was ${requestId} (type: ${typeof requestId}). Needs to be a string`
-      );
-    }
-    requestData[requestId] ??= {};
-    const startTime = process.hrtime();
-    const offset = process.hrtime(requestData[requestId].requestStartTime);
-
-    const logTime = () => {
-      if (!savedContextToRequestId) {
-        console.warn("Plugin is not configured with a requestId function");
-        return;
-      }
-      requestData[requestId].loaders ??= {};
-      requestData[requestId].loaders[name] ??= [];
-
-      requestData[requestId].loaders[name].push([
-        toReportTime(process.hrtime(startTime)),
-        toReportTime(offset),
-      ]);
-    };
-    try {
-      const result = fn(...args);
-      logTime();
-      return result;
-    } catch (e) {
-      logTime();
-      throw e;
-    }
-  };
-};
-export const wrapAsyncFunction = (
-  name: string,
-  context: GraphQLRequestContext["context"],
-  fn: (...args: any[]) => Promise<any>
-) => {
-  return async (...args: any[]) => {
-    const requestId = savedContextToRequestId(context);
-    if (!requestId || typeof requestId !== "string") {
-      console.warn(
-        `requestId was ${requestId} (type: ${typeof requestId}). Needs to be a string`
-      );
-    }
-    requestData[requestId] ??= {};
-    const startTime = process.hrtime();
-    const offset = process.hrtime(requestData[requestId].requestStartTime);
-
-    const logTime = () => {
-      if (!savedContextToRequestId) {
-        console.warn("Plugin is not configured with a requestId function");
-        return;
-      }
-      requestData[requestId].loaders ??= {};
-      requestData[requestId].loaders[name] ??= [];
-
-      requestData[requestId].loaders[name].push([
-        toReportTime(process.hrtime(startTime)),
-        toReportTime(offset),
-      ]);
-    };
-    try {
-      const result = await fn(...args);
-      logTime();
-      return result;
-    } catch (e) {
-      logTime();
-      throw e;
-    }
-  };
-};
-
-export const wrapLoaderFunction = <T, K>(
-  name: string,
-  context: GraphQLRequestContext["context"],
-  fn: (args: T[]) => Promise<K[]>
-): ((args: T[]) => Promise<K[]>) => {
-  return wrapAsyncFunction(name, context, fn) as (args: T[]) => Promise<K[]>;
-};
-
 const MAX_ERROR_BYTES = 1000;
-const MAX_RESOLVER_BYTES = 2000;
-
-const sha256 = (
-  data: string | Buffer | DataView | NodeJS.TypedArray
-): string => {
-  const schemaHash = createHash("sha256");
-  schemaHash.update(data);
-  return schemaHash.digest("hex");
-};
 
 interface CommonPluginArgs<T> {
   contextToRequestId: (context: GraphQLRequestContext<T>["context"]) => string;
   apiKey?: string;
-  /**
-   * A function to determine if a certain operation should be traced. It is
-   * common practice in performance tracing to only measure a subset of
-   * operations to reduce overhead. A simple function you could use is
-   * something like `() => Math.random() > 0.99`. Return true to include.
-   */
-  sampleFunction?: (ctx: GraphQLRequestContext<T>) => boolean;
   /**
    * If you wish to send the latest schema to Hubburu on server startup. The alternative is to send it with the pushHubburuSchema function in a CI pipeline.
    */
@@ -194,7 +88,6 @@ interface PendingReport {
 export interface HubburuReport {
   resolvers?: string | null;
   operationName?: string;
-  loaders?: { [name: string]: [number, number][] };
   requestId?: string;
   errors?: string | null;
   totalMs: number;
@@ -202,6 +95,7 @@ export interface HubburuReport {
   clientName?: string;
   clientVersion?: string;
   environment?: string;
+  enums?: { [name: string]: string[] };
   gzippedOperationBody: string;
   meta?: {
     postProcessingTime?: number;
@@ -221,6 +115,18 @@ const runQueue = () => {
 };
 const queueReport = (report: PendingReport): void => {
   queue.push(report);
+};
+
+const getTypeName = (v: TypeNode): string => {
+  switch (v.kind) {
+    case Kind.NAMED_TYPE:
+      return v.name.value;
+    case Kind.LIST_TYPE:
+    case Kind.NON_NULL_TYPE:
+      return getTypeName(v.type);
+    default:
+      return "";
+  }
 };
 
 const reportUrl =
@@ -279,7 +185,6 @@ export const HubburuApolloServerPlugin: <T = any>(
     apiKey = process.env.HUBBURU_API_KEY,
     pushSchemaOnStartup = false,
     environment = "default",
-    sampleFunction = () => true,
     shouldSend = () => true,
   } = args;
   savedContextToRequestId = contextToRequestId;
@@ -293,14 +198,18 @@ export const HubburuApolloServerPlugin: <T = any>(
   if (process.env.NODE_ENV === "test") {
     return {};
   }
+  let enumNames = new Set<string>();
   return {
     serverWillStart: async (service) => {
       if (!sendMode || sendMode === "BACKGROUND") {
         runQueue();
       }
+      Object.values(service.schema.getTypeMap()).forEach((val) => {
+        if (val.astNode?.kind === Kind.ENUM_TYPE_DEFINITION) {
+          enumNames.add(val.astNode.name.value);
+        }
+      });
       try {
-        const schemaSdl = printSchema(service.schema);
-        schemaSha256 = sha256(schemaSdl);
         if (pushSchemaOnStartup) {
           pushHubburuSchema({ schema: service.schema, apiKey, environment });
         }
@@ -310,38 +219,29 @@ export const HubburuApolloServerPlugin: <T = any>(
     },
     requestDidStart: async (ctx) => {
       const requestStartTime = process.hrtime();
-      const shouldTrace = sampleFunction(ctx);
       const requestId =
         savedContextToRequestId?.(ctx.context) ??
         (await new Promise((r) =>
           randomBytes(48, (err, buf) => r(buf.toString("hex")))
         ));
       requestData[requestId] = { requestStartTime };
-
-      const tracing = [];
-
       return {
-        executionDidStart: async () => {
-          if (!shouldTrace) return;
-          return {
-            willResolveField: ({ info }) => {
-              let path = info.fieldName;
-              let prev = info.path.prev;
-              while (prev) {
-                path = prev.key + "." + path;
-                prev = prev.prev;
-              }
-              const start = process.hrtime();
-              const offset = process.hrtime(requestStartTime);
-              return () => {
-                tracing.push([
-                  path,
-                  toReportTime(process.hrtime(start)),
-                  toReportTime(offset),
-                ]);
-              };
-            },
-          };
+        executionDidStart: async (executionStartContext) => {
+          const operationEnums: { [key: string]: Set<string> } = {};
+          let hasEnums = false;
+          executionStartContext.operation.variableDefinitions?.forEach((d) => {
+            const variableTypeName = getTypeName(d.type);
+            if (enumNames.has(variableTypeName)) {
+              hasEnums = true;
+              operationEnums[variableTypeName] ??= new Set<string>();
+              operationEnums[variableTypeName].add(
+                executionStartContext.request.variables[d.variable.name.value]
+              );
+            }
+          });
+          if (hasEnums) {
+            requestData[requestId].enums = operationEnums;
+          }
         },
         willSendResponse: async (requestContext) => {
           try {
@@ -358,16 +258,14 @@ export const HubburuApolloServerPlugin: <T = any>(
                 details: e.stack,
               };
             });
-            let [zippedErrors, zippedResolvers, zippedOperation] =
-              await Promise.all([
-                errors
-                  ? gzip(JSON.stringify(errors))
-                  : Promise.resolve(undefined),
-                gzip(JSON.stringify(tracing)),
-                stringOperation
-                  ? await gzip(stringOperation)
-                  : Promise.resolve(undefined),
-              ]);
+            let [zippedErrors, zippedOperation] = await Promise.all([
+              errors
+                ? gzip(JSON.stringify(errors))
+                : Promise.resolve(undefined),
+              stringOperation
+                ? await gzip(stringOperation)
+                : Promise.resolve(undefined),
+            ]);
 
             const errorsTooLarge =
               (zippedErrors?.byteLength ?? 0) > MAX_ERROR_BYTES;
@@ -375,57 +273,7 @@ export const HubburuApolloServerPlugin: <T = any>(
               zippedErrors = await gzip(JSON.stringify(errors.slice(0, 5)));
             }
 
-            const resolversTooLarge =
-              (zippedResolvers?.byteLength ?? 0) > MAX_RESOLVER_BYTES;
             const totalMs = toReportTime(process.hrtime(requestStartTime));
-
-            if (resolversTooLarge) {
-              const pathNormalized: {
-                [key: string]: {
-                  min: typeof tracing[number];
-                  max: typeof tracing[number];
-                };
-              } = {};
-              for (let i = 0; i < tracing.length; i++) {
-                const trace = tracing[i];
-                if (trace[0].match(/\.[0-9]+\./)) {
-                  const normalized = trace[0].replace(/\.[0-9]+\./g, ".X.");
-                  pathNormalized[normalized] ??= {
-                    min: ["", Number.MAX_SAFE_INTEGER, 0],
-                    max: ["", 0, 0],
-                  };
-                  if (trace[1] <= pathNormalized[normalized].min[1]) {
-                    pathNormalized[normalized].min = trace;
-                  }
-                  if (trace[1] >= pathNormalized[normalized].max[1]) {
-                    pathNormalized[normalized].max = trace;
-                  }
-                }
-              }
-              const newList: typeof tracing = [];
-              for (const trace of tracing) {
-                if (trace[0].match(/[0-9]/)) {
-                  const normalized = trace[0].replace(/\.[0-9]+\./g, ".X.");
-                  const fromNormalized = pathNormalized[normalized];
-                  if (!fromNormalized) {
-                    continue;
-                  }
-                  newList.push(fromNormalized.min);
-                  if (fromNormalized.max[0] !== fromNormalized.min[0]) {
-                    newList.push(fromNormalized.max);
-                  }
-                  delete pathNormalized[normalized];
-                } else {
-                  newList.push(trace);
-                }
-              }
-
-              zippedResolvers = await gzip(
-                JSON.stringify(
-                  newList.slice(0, 200).sort((a, b) => a[2] - b[2])
-                )
-              );
-            }
 
             const report: HubburuReport = {
               requestId,
@@ -433,20 +281,26 @@ export const HubburuApolloServerPlugin: <T = any>(
               totalMs,
               operationName: ctx.operationName,
               gzippedOperationBody: zippedOperation?.toString("base64"),
-              loaders: reqData?.loaders,
-              resolvers: zippedResolvers.toString("base64"),
               environment,
               createdAt: new Date().toISOString(),
+              clientName: args.getClientName?.(ctx),
+              clientVersion: args.getClientVersion?.(ctx),
               meta: {
                 errorsTooLarge: errorsTooLarge ? errors.length : undefined,
-                resolversTooLarge: resolversTooLarge
-                  ? tracing.length
-                  : undefined,
                 postProcessingTime: toReportTime(
                   process.hrtime(postProcessingTimeStart)
                 ),
               },
             };
+
+            if (reqData.enums) {
+              report.enums = {};
+              Object.entries(
+                reqData.enums as { [key: string]: Set<string> }
+              ).forEach(([key, set]) => {
+                report.enums[key] = Array.from(set);
+              });
+            }
 
             if (!shouldSend(report)) return;
 

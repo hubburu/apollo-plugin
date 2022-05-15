@@ -17,7 +17,6 @@ These are the integration points you need to make to integrate with Hubburu.
 1. Add your API key
 2. Upload schema SDL to Hubburu
 3. Send operation reports to Hubburu
-4. (Optional) Measure functions outside of the GraphQL context
 
 ### Adding Your API Key
 
@@ -55,67 +54,6 @@ const server = new ApolloServer({
     }),
   ],
 });
-```
-
-You control if a trace should be gathered (which adds overhead!) with the `sampleFunction` parameter.
-
-### Measure Functions Outside of the GraphQL Context
-
-Hubburu supports measuring functions outside the GraphQL Context. We call these "Loader functions".
-
-To use this function you will need to provide your own Request ID. Hubburu will use this Request ID to connect the loader call to the GraphQL trace.
-A common pattern is to generate a UUID v4 and attach it to your GraphQL context, and track that id throughout your different services. That kind of ID is suitable for this use case.
-
-Hubburu exposes three functions for this purpose: `wrapLoaderFunction` (intended for dataloader), `wrapAsyncFunction` for generic async function and `wrapSyncFunction`.
-
-**wrapLoaderFunction**
-
-```javascript
-const loaderFunction = async (ids) => {
-  const users = await loadUsers(ids);
-  const lookup = {};
-  users.forEach((user) => {
-    lookup[user.id] = user;
-  });
-  return ids.map((i) => lookup[i]);
-})
-
-const userLoaderWithoutHubburu = new DataLoader(loaderFunction);
-
-const userLoaderWithHubburu = new DataLoader(
-  wrapLoaderFunction('user', context, loaderFunction)
-);
-```
-
-**wrapAsyncFunction**
-
-```javascript
-const functionToMeasure = () => {
-  return fetch(...).json()
-}
-
-const withMeasuring = wrapAsyncFunction('load_misc_data', context, functionToMeasure);
-
-//Now instead of functionToMeasure, use withMeasuring
-const result = await withMeasuring()
-```
-
-**wrapSyncFunction**
-
-```javascript
-const functionToMeasure = () => {
-  const hardComputation = 1 + 2;
-  return hardComputation;
-};
-
-const withMeasuring = wrapAsyncFunction(
-  "compute_data",
-  context,
-  functionToMeasure
-);
-
-//Now instead of functionToMeasure, use withMeasuring
-const result = withMeasuring();
 ```
 
 ## Development & Testing
