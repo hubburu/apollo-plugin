@@ -2,8 +2,14 @@ import type {
   ApolloServerPlugin,
   GraphQLRequestContext,
 } from "apollo-server-plugin-base";
-import { createHash, randomBytes } from "crypto";
-import { GraphQLSchema, Kind, printSchema, TypeNode } from "graphql";
+import { randomBytes } from "crypto";
+import {
+  GraphQLSchema,
+  InputObjectTypeDefinitionNode,
+  Kind,
+  printSchema,
+  TypeNode,
+} from "graphql";
 import fetch from "node-fetch";
 import util from "util";
 import { gzip as nonPromiseGzip } from "zlib";
@@ -198,17 +204,46 @@ export const HubburuApolloServerPlugin: <T = any>(
   if (process.env.NODE_ENV === "test") {
     return {};
   }
-  let enumNames = new Set<string>();
+  const enumNames = new Set<string>();
+  const inputEnums: { [typeName: string]: { [fieldName: string]: string } } =
+    {};
+  const nestedInputMap: {
+    [typeName: string]: { [fieldName: string]: string };
+  } = {};
   return {
     serverWillStart: async (service) => {
       if (!sendMode || sendMode === "BACKGROUND") {
         runQueue();
       }
+      const inputObjects: InputObjectTypeDefinitionNode[] = [];
+      const inputNames = new Set<string>();
       Object.values(service.schema.getTypeMap()).forEach((val) => {
-        if (val.astNode?.kind === Kind.ENUM_TYPE_DEFINITION) {
-          enumNames.add(val.astNode.name.value);
+        switch (val.astNode?.kind) {
+          case Kind.ENUM_TYPE_DEFINITION: {
+            enumNames.add(val.astNode.name.value);
+            break;
+          }
+          case Kind.INPUT_OBJECT_TYPE_DEFINITION: {
+            inputNames.add(val.astNode.name.value);
+            inputObjects.push(val.astNode);
+            break;
+          }
         }
       });
+      for (const inputObj of inputObjects) {
+        const inputObjName = inputObj.name.value;
+        inputObj.fields.filter((f) => {
+          const name = getTypeName(f.type);
+          if (enumNames.has(name)) {
+            inputEnums[inputObjName] ??= {};
+            inputEnums[inputObjName][f.name.value] = name;
+          } else if (inputNames.has(name)) {
+            nestedInputMap[inputObjName] ??= {};
+            nestedInputMap[inputObjName][f.name.value] = name;
+          }
+        });
+      }
+
       try {
         if (pushSchemaOnStartup) {
           pushHubburuSchema({ schema: service.schema, apiKey, environment });
@@ -229,18 +264,72 @@ export const HubburuApolloServerPlugin: <T = any>(
         executionDidStart: async (executionStartContext) => {
           const operationEnums: { [key: string]: Set<string> } = {};
           let hasEnums = false;
-          executionStartContext.operation.variableDefinitions?.forEach((d) => {
-            const variableTypeName = getTypeName(d.type);
-            if (enumNames.has(variableTypeName)) {
-              hasEnums = true;
-              operationEnums[variableTypeName] ??= new Set<string>();
-              operationEnums[variableTypeName].add(
-                executionStartContext.request.variables[d.variable.name.value]
-              );
+          try {
+            const extractEnumsInVariables = ({
+              variableTypeName,
+              variableName,
+              variables,
+            }: {
+              variableTypeName: string;
+              variableName: string;
+              variables: Record<string, unknown>;
+            }) => {
+              if (!variables) return;
+
+              if (enumNames.has(variableTypeName)) {
+                hasEnums = true;
+                operationEnums[variableTypeName] ??= new Set<string>();
+                operationEnums[variableTypeName].add(
+                  variables[variableName] as string
+                );
+              } else if (
+                inputEnums[variableTypeName] &&
+                variables[variableName]
+              ) {
+                Object.entries(variables[variableName]).forEach(
+                  ([inputFieldName, inputFieldValue]) => {
+                    const enumName =
+                      inputEnums[variableTypeName][inputFieldName];
+                    if (enumName) {
+                      hasEnums = true;
+                      operationEnums[enumName] ??= new Set<string>();
+                      operationEnums[enumName].add(inputFieldValue as string);
+                    }
+                  }
+                );
+              }
+              if (nestedInputMap[variableTypeName]) {
+                Object.entries(nestedInputMap[variableTypeName]).forEach(
+                  ([fieldName, fieldType]) => {
+                    extractEnumsInVariables({
+                      variables: variables[variableName] as Record<
+                        string,
+                        unknown
+                      >,
+                      variableName: fieldName,
+                      variableTypeName: fieldType,
+                    });
+                  }
+                );
+              }
+            };
+
+            executionStartContext.operation.variableDefinitions?.forEach(
+              (d) => {
+                const variableTypeName = getTypeName(d.type);
+                const variableName = d.variable.name.value;
+                extractEnumsInVariables({
+                  variableName,
+                  variableTypeName,
+                  variables: executionStartContext.request.variables,
+                });
+              }
+            );
+            if (hasEnums) {
+              requestData[requestId].enums = operationEnums;
             }
-          });
-          if (hasEnums) {
-            requestData[requestId].enums = operationEnums;
+          } catch (e) {
+            console.warn(e);
           }
         },
         willSendResponse: async (requestContext) => {
