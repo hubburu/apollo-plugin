@@ -1,11 +1,10 @@
 {
   "name": "hubburu",
-  "version": "0.0.12",
+  "version": "0.0.13",
   "description": "A middleware for integrating Hubburu with Apollo Server",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
     "prepublish": "tsc"
   },
   "public": true,

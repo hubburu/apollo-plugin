@@ -4,7 +4,6 @@
     "rootDir": "./",
     "resolveJsonModule": true,
     "moduleResolution": "node",
-    "module": "commonjs",
     "esModuleInterop": true,
     "skipLibCheck": true,
     "allowJs": true,
